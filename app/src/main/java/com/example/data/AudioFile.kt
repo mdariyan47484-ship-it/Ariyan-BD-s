@@ -11,14 +11,19 @@ data class AudioFile(
     val sizeBytes: Long = 0L,
     val format: String = "Audio",
     val isPreset: Boolean = false,
-    val presetType: PresetSoundType? = null
+    val presetType: PresetSoundType? = null,
+    val coverArtPath: String? = null,
+    val customCoverUri: Uri? = null,
+    val themeColorHex: String = "#B026FF"
 )
 
 enum class PresetSoundType {
     CYBER_BEEP,
     VOICE_TEST,
     BASS_PULSE,
-    GAME_ALERT
+    GAME_ALERT,
+    VICTORY_HORN,
+    LASER_STRIKE
 }
 
 enum class AudioRoutingMode(val title: String, val subtitle: String) {

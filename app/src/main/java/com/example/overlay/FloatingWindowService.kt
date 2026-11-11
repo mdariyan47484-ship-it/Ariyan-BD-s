@@ -9,6 +9,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -16,27 +18,31 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
-import android.util.DisplayMetrics
+import android.util.LruCache
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.audio.AudioPlayerManager
-import com.example.audio.AudioPlayerService
 import com.example.data.AppSettings
+import com.example.data.AudioFile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import java.io.File
 import kotlin.math.abs
 
 class FloatingWindowService : Service() {
@@ -56,12 +62,18 @@ class FloatingWindowService : Service() {
 
     private var isPanelExpanded = false
 
-    // Views inside panel for updating
+    // Soundboard UI components
+    private var gridLayout: GridLayout? = null
     private var tvPanelTrackTitle: TextView? = null
-    private var tvPanelRoutingMode: TextView? = null
+    private var tvPanelTrackStatus: TextView? = null
     private var btnPanelPlayPause: ImageView? = null
     private var panelVolumeSeekBar: SeekBar? = null
-    private var visualizerEqualizerView: EqualizerAnimationView? = null
+    private var currentPlayingVisualizer: EqualizerAnimationView? = null
+
+    // Bitmap cache for smooth soundboard rendering
+    private val bitmapCache = object : LruCache<String, Bitmap>(20 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -73,7 +85,7 @@ class FloatingWindowService : Service() {
         startServiceForeground()
 
         initBubbleView()
-        initPanelView()
+        initSoundboardPanelView()
         observePlayerState()
     }
 
@@ -99,8 +111,8 @@ class FloatingWindowService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return NotificationCompat.Builder(this, OVERLAY_CHANNEL_ID)
-            .setContentTitle("ARIYAN A9X Floating Window Active")
-            .setContentText("Overlay controller running over apps")
+            .setContentTitle("ARIYAN A9X Soundboard Active")
+            .setContentText("Tap floating bubble to access soundboard tiles")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -114,7 +126,7 @@ class FloatingWindowService : Service() {
                 "Ariyan Floating Overlay",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows when floating overlay controller is active"
+                description = "Shows when floating soundboard is active"
             }
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
@@ -124,7 +136,7 @@ class FloatingWindowService : Service() {
     @SuppressLint("ClickableViewAccessibility")
     private fun initBubbleView() {
         val sizeDp = appSettings.bubbleSize.value
-        val sizePx = (sizeDp * resources.displayMetrics.density).toInt()
+        val sizePx = dpToPx(sizeDp.toFloat())
 
         val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -150,7 +162,7 @@ class FloatingWindowService : Service() {
             alpha = appSettings.bubbleAlpha.value
         }
 
-        // Circular neon background
+        // Circular neon background with cyber glow
         val bgDrawable = GradientDrawable().apply {
             shape = GradientDrawable.OVAL
             setColor(Color.parseColor("#120E22"))
@@ -198,10 +210,8 @@ class FloatingWindowService : Service() {
                 }
                 MotionEvent.ACTION_UP -> {
                     if (!isMoving) {
-                        // Single tap -> expand to Panel
                         expandPanel()
                     } else {
-                        // Snap to nearest edge (left or right)
                         snapBubbleToEdge()
                     }
                     true
@@ -217,8 +227,7 @@ class FloatingWindowService : Service() {
     }
 
     private fun snapBubbleToEdge() {
-        val metrics = resources.displayMetrics
-        val screenWidth = metrics.widthPixels
+        val screenWidth = resources.displayMetrics.widthPixels
         val currentX = bubbleLayoutParams.x
         val targetX = if (currentX + (bubbleContainer?.width ?: 0) / 2 < screenWidth / 2) {
             20
@@ -233,8 +242,11 @@ class FloatingWindowService : Service() {
         }
     }
 
-    private fun initPanelView() {
-        val widthPx = (320 * resources.displayMetrics.density).toInt()
+    private fun initSoundboardPanelView() {
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val widthPx = (screenWidth * 0.90f).toInt().coerceIn(dpToPx(320f), dpToPx(380f))
+        val maxGridHeightPx = dpToPx(280f)
 
         val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -251,27 +263,27 @@ class FloatingWindowService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = 200
+            y = dpToPx(60f)
         }
 
         val root = FrameLayout(this)
 
-        // Glassmorphism cyberpunk panel container
+        // Glassmorphism Gaming Panel Container
         val contentCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val pad = dpToPx(16f)
+            val pad = dpToPx(14f)
             setPadding(pad, pad, pad, pad)
 
             val bg = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dpToPx(18f).toFloat()
-                setColor(Color.parseColor("#E60D0A1C")) // 90% opacity deep dark purple
-                setStroke(dpToPx(1.5f), Color.parseColor("#B026FF"))
+                cornerRadius = dpToPx(20f).toFloat()
+                setColor(Color.parseColor("#F0080614")) // 94% opacity deep dark purple
+                setStroke(dpToPx(1.8f), Color.parseColor("#B026FF"))
             }
             background = bg
         }
 
-        // Header Row (Logo + Title + Minimize + Close)
+        // 1. Header (Logo + Title + Minimize + Close)
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -279,7 +291,7 @@ class FloatingWindowService : Service() {
 
         val logoSmall = ImageView(this).apply {
             setImageResource(R.drawable.ic_app_logo)
-            val size = dpToPx(28f)
+            val size = dpToPx(26f)
             layoutParams = LinearLayout.LayoutParams(size, size).apply {
                 marginEnd = dpToPx(8f)
             }
@@ -287,33 +299,31 @@ class FloatingWindowService : Service() {
         headerRow.addView(logoSmall)
 
         val headerText = TextView(this).apply {
-            text = "ARIYAN A9X BD"
+            text = "ARIYAN A9X SOUNDBOARD"
             setTextColor(Color.parseColor("#00F0FF"))
-            textSize = 14f
+            textSize = 13f
             typeface = Typeface.DEFAULT_BOLD
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
         headerRow.addView(headerText)
 
-        // Minimize Button
         val btnMinimize = TextView(this).apply {
             text = "—"
             setTextColor(Color.parseColor("#A5A2BF"))
             textSize = 18f
             typeface = Typeface.DEFAULT_BOLD
-            val pad = dpToPx(6f)
+            val pad = dpToPx(8f)
             setPadding(pad, 0, pad, 0)
             setOnClickListener { collapsePanel() }
         }
         headerRow.addView(btnMinimize)
 
-        // Close Button
         val btnClose = TextView(this).apply {
             text = "✕"
             setTextColor(Color.parseColor("#FF1744"))
             textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
-            val pad = dpToPx(6f)
+            val pad = dpToPx(8f)
             setPadding(pad, 0, pad, 0)
             setOnClickListener { stopSelf() }
         }
@@ -321,44 +331,108 @@ class FloatingWindowService : Service() {
 
         contentCard.addView(headerRow)
 
-        // Equalizer animation
-        visualizerEqualizerView = EqualizerAnimationView(this).apply {
+        // 2. Soundboard Category Subheader
+        val subheaderRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dpToPx(28f)
+                LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dpToPx(10f)
-                bottomMargin = dpToPx(6f)
+                topMargin = dpToPx(6f)
+                bottomMargin = dpToPx(8f)
             }
         }
-        contentCard.addView(visualizerEqualizerView)
 
-        // Track title
+        val tvGridLabel = TextView(this).apply {
+            text = "SELECT AUDIO TO INJECT / PLAY"
+            setTextColor(Color.parseColor("#A5A2BF"))
+            textSize = 10f
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.08f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        subheaderRow.addView(tvGridLabel)
+
+        contentCard.addView(subheaderRow)
+
+        // 3. Scrollable Soundboard Grid (2 Columns of Individual Audio Tiles)
+        val scrollView = ScrollView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                maxGridHeightPx
+            )
+            isVerticalScrollBarEnabled = true
+        }
+
+        gridLayout = GridLayout(this).apply {
+            columnCount = 2
+            alignmentMode = GridLayout.ALIGN_BOUNDS
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+        scrollView.addView(gridLayout)
+        contentCard.addView(scrollView)
+
+        // 4. Divider Line
+        val divider = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dpToPx(1f)
+            ).apply {
+                topMargin = dpToPx(10f)
+                bottomMargin = dpToPx(8f)
+            }
+            setBackgroundColor(Color.parseColor("#261E42"))
+        }
+        contentCard.addView(divider)
+
+        // 5. Active Playing Info Bar
+        val activeTrackRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                bottomMargin = dpToPx(8f)
+            }
+        }
+
+        val trackDetailsCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
         tvPanelTrackTitle = TextView(this).apply {
-            text = "Select Audio Track"
+            text = "Song 01 - Cyber Sonic Pulse"
             setTextColor(Color.WHITE)
-            textSize = 13f
+            textSize = 12f
             typeface = Typeface.DEFAULT_BOLD
             maxLines = 1
             ellipsize = android.text.TextUtils.TruncateAt.END
         }
-        contentCard.addView(tvPanelTrackTitle)
+        trackDetailsCol.addView(tvPanelTrackTitle)
 
-        // Routing mode indicator
-        tvPanelRoutingMode = TextView(this).apply {
-            text = "Mode: Acoustic Loudspeaker"
+        tvPanelTrackStatus = TextView(this).apply {
+            text = "STATUS: READY"
             setTextColor(Color.parseColor("#00E676"))
-            textSize = 11f
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                bottomMargin = dpToPx(10f)
-            }
+            textSize = 10f
+            typeface = Typeface.DEFAULT_BOLD
         }
-        contentCard.addView(tvPanelRoutingMode)
+        trackDetailsCol.addView(tvPanelTrackStatus)
+        activeTrackRow.addView(trackDetailsCol)
 
-        // Playback Controls Row (Previous, Play/Pause, Next, Stop)
+        currentPlayingVisualizer = EqualizerAnimationView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dpToPx(48f), dpToPx(20f))
+        }
+        activeTrackRow.addView(currentPlayingVisualizer)
+
+        contentCard.addView(activeTrackRow)
+
+        // 6. Playback Controls Row (Prev, Play/Pause, Next, Stop)
         val controlsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -366,7 +440,7 @@ class FloatingWindowService : Service() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                bottomMargin = dpToPx(10f)
+                bottomMargin = dpToPx(8f)
             }
         }
 
@@ -392,7 +466,7 @@ class FloatingWindowService : Service() {
 
         contentCard.addView(controlsRow)
 
-        // Volume row
+        // 7. Volume Slider Row
         val volumeRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -426,10 +500,202 @@ class FloatingWindowService : Service() {
 
         root.addView(contentCard)
         panelContainer = root
+
+        // Initial render of soundboard grid
+        populateSoundboardGrid(playerManager.playlist.value, playerManager.currentTrack.value, playerManager.isPlaying.value)
+    }
+
+    private fun populateSoundboardGrid(
+        playlist: List<AudioFile>,
+        currentTrack: AudioFile?,
+        isPlaying: Boolean
+    ) {
+        val grid = gridLayout ?: return
+        grid.removeAllViews()
+
+        val displayMetrics = resources.displayMetrics
+        val screenWidth = displayMetrics.widthPixels
+        val panelWidth = (screenWidth * 0.90f).toInt().coerceIn(dpToPx(320f), dpToPx(380f))
+        val tilePadding = dpToPx(14f) * 2
+        val tileSpacing = dpToPx(8f)
+        val tileWidth = ((panelWidth - tilePadding - tileSpacing) / 2).coerceAtLeast(dpToPx(130f))
+        val tileHeight = dpToPx(110f)
+
+        for (track in playlist) {
+            val isCurrent = track.id == currentTrack?.id
+            val isThisPlaying = isCurrent && isPlaying
+
+            val tileView = createSoundboardTileView(
+                track = track,
+                widthPx = tileWidth,
+                heightPx = tileHeight,
+                isCurrent = isCurrent,
+                isPlaying = isThisPlaying
+            ) {
+                // Click To Play: clicking any tile immediately plays that audio file!
+                playerManager.playOrToggleTrack(track)
+            }
+
+            val params = GridLayout.LayoutParams().apply {
+                width = tileWidth
+                height = tileHeight
+                val margin = dpToPx(4f)
+                setMargins(margin, margin, margin, margin)
+            }
+            grid.addView(tileView, params)
+        }
+    }
+
+    private fun createSoundboardTileView(
+        track: AudioFile,
+        widthPx: Int,
+        heightPx: Int,
+        isCurrent: Boolean,
+        isPlaying: Boolean,
+        onClick: () -> Unit
+    ): View {
+        val tileRoot = FrameLayout(this).apply {
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(14f).toFloat()
+                setColor(Color.parseColor("#17112E"))
+                val strokeColor = if (isCurrent) {
+                    if (isPlaying) Color.parseColor("#00F0FF") else Color.parseColor("#B026FF")
+                } else {
+                    Color.parseColor("#2E2355")
+                }
+                setStroke(dpToPx(if (isCurrent) 2f else 1.2f), strokeColor)
+            }
+            background = bg
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+        }
+
+        // Cover Art Image
+        val coverImageView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+
+            val bitmap = getTrackBitmap(track)
+            if (bitmap != null) {
+                setImageBitmap(bitmap)
+            } else {
+                setImageResource(R.drawable.ic_app_logo)
+            }
+        }
+        tileRoot.addView(coverImageView)
+
+        // Dark gradient scrim overlay so text is crisp
+        val scrimView = View(this).apply {
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+            val scrimDrawable = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(Color.parseColor("#33000000"), Color.parseColor("#D9070511"))
+            )
+            background = scrimDrawable
+        }
+        tileRoot.addView(scrimView)
+
+        // Play/Pause State Badge in Center
+        val playStateIcon = ImageView(this).apply {
+            val iconSize = dpToPx(28f)
+            layoutParams = FrameLayout.LayoutParams(iconSize, iconSize).apply {
+                gravity = Gravity.CENTER
+            }
+            setImageResource(
+                if (isPlaying) android.R.drawable.ic_media_pause
+                else android.R.drawable.ic_media_play
+            )
+            val iconBg = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                if (isPlaying) {
+                    setColor(Color.parseColor("#B026FF"))
+                    setStroke(dpToPx(1.5f), Color.parseColor("#00F0FF"))
+                } else {
+                    setColor(Color.parseColor("#B3000000"))
+                }
+            }
+            background = iconBg
+            val pad = dpToPx(6f)
+            setPadding(pad, pad, pad, pad)
+        }
+        tileRoot.addView(playStateIcon)
+
+        // Top-left Track Tag (e.g. SONG 01 / WAV)
+        val tagBadge = TextView(this).apply {
+            text = if (track.isPreset) track.title.substringBefore(" - ") else track.format
+            setTextColor(Color.parseColor("#00F0FF"))
+            textSize = 9f
+            typeface = Typeface.DEFAULT_BOLD
+            val padH = dpToPx(6f)
+            val padV = dpToPx(2f)
+            setPadding(padH, padV, padH, padV)
+            val bg = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dpToPx(6f).toFloat()
+                setColor(Color.parseColor("#CC000000"))
+            }
+            background = bg
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                val m = dpToPx(6f)
+                setMargins(m, m, 0, 0)
+            }
+        }
+        tileRoot.addView(tagBadge)
+
+        // Bottom Title Label
+        val titleLabel = TextView(this).apply {
+            text = track.title.substringAfter(" - ").ifBlank { track.title }
+            setTextColor(Color.WHITE)
+            textSize = 11f
+            typeface = Typeface.DEFAULT_BOLD
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.BOTTOM
+                val m = dpToPx(6f)
+                setMargins(m, 0, m, m)
+            }
+        }
+        tileRoot.addView(titleLabel)
+
+        return tileRoot
+    }
+
+    private fun getTrackBitmap(track: AudioFile): Bitmap? {
+        val path = track.coverArtPath ?: return null
+        bitmapCache.get(path)?.let { return it }
+
+        return try {
+            val file = File(path)
+            if (file.exists()) {
+                val bmp = BitmapFactory.decodeFile(file.absolutePath)
+                if (bmp != null) {
+                    bitmapCache.put(path, bmp)
+                }
+                bmp
+            } else null
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private fun createControlButton(iconRes: Int, isAccent: Boolean = false, onClick: () -> Unit): ImageView {
-        val sizePx = dpToPx(if (isAccent) 44f else 36f)
+        val sizePx = dpToPx(if (isAccent) 42f else 34f)
         return ImageView(this).apply {
             setImageResource(iconRes)
             val pad = dpToPx(if (isAccent) 8f else 6f)
@@ -460,6 +726,8 @@ class FloatingWindowService : Service() {
             bubbleContainer?.let { windowManager.removeView(it) }
             panelContainer?.let { windowManager.addView(it, panelLayoutParams) }
             isPanelExpanded = true
+            // Refresh tiles with latest states
+            populateSoundboardGrid(playerManager.playlist.value, playerManager.currentTrack.value, playerManager.isPlaying.value)
         } catch (_: Exception) {}
     }
 
@@ -475,8 +743,14 @@ class FloatingWindowService : Service() {
     private fun observePlayerState() {
         stateObserverJob = scope.launch {
             launch {
+                playerManager.playlist.collectLatest { playlist ->
+                    populateSoundboardGrid(playlist, playerManager.currentTrack.value, playerManager.isPlaying.value)
+                }
+            }
+            launch {
                 playerManager.currentTrack.collectLatest { track ->
                     tvPanelTrackTitle?.text = track?.title ?: "Select Audio Track"
+                    populateSoundboardGrid(playerManager.playlist.value, track, playerManager.isPlaying.value)
                 }
             }
             launch {
@@ -485,17 +759,17 @@ class FloatingWindowService : Service() {
                         if (isPlaying) android.R.drawable.ic_media_pause
                         else android.R.drawable.ic_media_play
                     )
-                    visualizerEqualizerView?.setPlaying(isPlaying)
+                    tvPanelTrackStatus?.text = if (isPlaying) "STATUS: INJECTING..." else "STATUS: PAUSED"
+                    tvPanelTrackStatus?.setTextColor(
+                        if (isPlaying) Color.parseColor("#00E676") else Color.parseColor("#FFB300")
+                    )
+                    currentPlayingVisualizer?.setPlaying(isPlaying)
+                    populateSoundboardGrid(playerManager.playlist.value, playerManager.currentTrack.value, isPlaying)
                 }
             }
             launch {
                 playerManager.volume.collectLatest { vol ->
                     panelVolumeSeekBar?.progress = (vol * 100).toInt()
-                }
-            }
-            launch {
-                playerManager.routingEngine.currentMode.collectLatest { mode ->
-                    tvPanelRoutingMode?.text = "Mode: ${mode.title}"
                 }
             }
         }
@@ -535,14 +809,8 @@ class FloatingWindowService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, FloatingWindowService::class.java))
         }
-
-        fun isRunning(context: Context): Boolean {
-            // Helper check
-            return true
-        }
     }
 
-    // Custom lightweight animated equalizer view for the floating panel
     private class EqualizerAnimationView(context: Context) : View(context) {
         private var isPlaying = false
         private val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
@@ -567,7 +835,7 @@ class FloatingWindowService : Service() {
 
             for (i in 0 until barCount) {
                 val currentHeight = if (isPlaying) {
-                    val variation = kotlin.math.abs(kotlin.math.sin((frameCount + i * 4) * 0.15f))
+                    val variation = abs(kotlin.math.sin((frameCount + i * 4) * 0.15f))
                     (h * 0.2f) + (h * 0.8f * variation)
                 } else {
                     h * 0.2f
