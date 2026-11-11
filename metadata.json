@@ -1,0 +1,6 @@
+{
+  "name": "Ariyan A9X",
+  "description": "ARIYAN A9X BD OFFICIAL - Voice Float Injector, Advanced Android Audio Routing, Shizuku Integration & Floating Overlay",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
